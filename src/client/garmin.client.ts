@@ -66,6 +66,7 @@ import {
   TRAINING_PLANS_ENDPOINT,
   ADAPTIVE_TRAINING_PLAN_ENDPOINT,
   SCHEDULED_WORKOUT_ENDPOINT,
+  CALENDAR_ENDPOINT,
   MENSTRUAL_CALENDAR_ENDPOINT,
   MENSTRUAL_DAYVIEW_ENDPOINT,
   PREGNANCY_SNAPSHOT_ENDPOINT,
@@ -94,6 +95,26 @@ import {
   DAILY_STEPS_MAX_RANGE_DAYS,
   BIOMETRIC_STATS_ENDPOINT,
 } from '../constants/garmin-endpoints';
+import { EXERCISES_CATALOG_URL, DEFAULT_EXERCISE_SEARCH_LIMIT } from '../constants/workout-types';
+import type { CreateSwimWorkoutDto, CreateStrengthWorkoutDto, SearchExercisesDto } from '../dtos';
+import { buildSwimWorkout, buildStrengthWorkout } from './workout-builder';
+
+type CalendarItem = {
+  id: number;
+  itemType: string;
+  title: string | null;
+  date: string;
+  workoutId: number | null;
+  sportTypeKey: string | null;
+  protectedWorkoutSchedule: boolean | null;
+};
+
+type ExerciseCatalog = {
+  categories: Record<
+    string,
+    { exercises: Record<string, { primaryMuscles: string[]; secondaryMuscles: string[] }> }
+  >;
+};
 
 function todayString(): string {
   return new Date().toISOString().split('T')[0]!;
@@ -101,6 +122,7 @@ function todayString(): string {
 
 export class GarminClient {
   private auth: GarminAuth;
+  private exerciseCatalog?: ExerciseCatalog;
 
   constructor(email: string, password: string, promptMfa?: () => Promise<string>) {
     this.auth = new GarminAuth(email, password, promptMfa);
@@ -749,5 +771,132 @@ export class GarminClient {
       `${GEAR_UNLINK_ENDPOINT}/${gearUuid}/activity/${activityId}`,
       { method: 'PUT' },
     );
+  }
+
+  private async getExerciseCatalog(): Promise<ExerciseCatalog> {
+    this.exerciseCatalog ??= await this.request<ExerciseCatalog>(EXERCISES_CATALOG_URL);
+    return this.exerciseCatalog;
+  }
+
+  async searchExercises(params: SearchExercisesDto): Promise<unknown> {
+    const catalog = await this.getExerciseCatalog();
+    const terms = (params.query ?? '').toUpperCase().split(/[\s_-]+/).filter(Boolean);
+    const category = params.category?.toUpperCase();
+    const muscle = params.muscle?.toUpperCase();
+
+    const results = Object.entries(catalog.categories)
+      .filter(([name]) => !category || name === category)
+      .flatMap(([name, { exercises }]) =>
+        Object.entries(exercises).map(([exerciseName, muscles]) => ({
+          category: name,
+          exerciseName,
+          ...muscles,
+        })),
+      )
+      .filter((exercise) => terms.every((term) => exercise.exerciseName.includes(term)))
+      .filter(
+        (exercise) =>
+          !muscle || exercise.primaryMuscles.includes(muscle) || exercise.secondaryMuscles.includes(muscle),
+      );
+
+    const limit = params.limit ?? DEFAULT_EXERCISE_SEARCH_LIMIT;
+    return { total: results.length, exercises: results.slice(0, limit) };
+  }
+
+  private async validateExercises(dto: CreateStrengthWorkoutDto): Promise<void> {
+    const catalog = await this.getExerciseCatalog();
+    const steps = dto.steps.flatMap((item) => (item.type === 'repeat' ? item.steps : [item]));
+    const invalid = steps
+      .filter((step) => step.category && step.exerciseName)
+      .filter((step) => !catalog.categories[step.category!]?.exercises[step.exerciseName!])
+      .map((step) => `${step.category}/${step.exerciseName}`);
+
+    if (invalid.length > 0) {
+      throw new Error(`Unknown Garmin exercises: ${invalid.join(', ')}. Use search_exercises to find valid names`);
+    }
+  }
+
+  private async createWorkout(payload: Record<string, unknown>, scheduleDate?: string): Promise<unknown> {
+    const workout = await this.request<{ workoutId: number }>(WORKOUT_ENDPOINT, {
+      method: 'POST',
+      body: payload,
+    });
+    if (!scheduleDate) return workout;
+
+    const schedule = await this.scheduleWorkout(workout.workoutId, scheduleDate);
+    return { workout, schedule };
+  }
+
+  async createSwimWorkout(dto: CreateSwimWorkoutDto): Promise<unknown> {
+    return this.createWorkout(buildSwimWorkout(dto), dto.scheduleDate);
+  }
+
+  async createStrengthWorkout(dto: CreateStrengthWorkoutDto): Promise<unknown> {
+    await this.validateExercises(dto);
+    return this.createWorkout(buildStrengthWorkout(dto), dto.scheduleDate);
+  }
+
+  async scheduleWorkout(workoutId: number, date: string): Promise<unknown> {
+    const { workout, ...schedule } = await this.request<{
+      workout?: { workoutName?: string };
+      workoutScheduleId: number;
+      calendarDate: string;
+    }>(`${SCHEDULED_WORKOUT_ENDPOINT}/${workoutId}`, {
+      method: 'POST',
+      body: { date },
+    });
+    return {
+      workoutScheduleId: schedule.workoutScheduleId,
+      calendarDate: schedule.calendarDate,
+      workoutId,
+      workoutName: workout?.workoutName,
+    };
+  }
+
+  async listScheduledWorkouts(startDate: string, endDate: string): Promise<unknown> {
+    if (startDate > endDate) {
+      throw new Error(`startDate ${startDate} must not be after endDate ${endDate}`);
+    }
+
+    const months: { year: number; month: number }[] = [];
+    const cursor = new Date(`${startDate.slice(0, 7)}-01T00:00:00Z`);
+    const last = new Date(`${endDate.slice(0, 7)}-01T00:00:00Z`);
+    while (cursor <= last) {
+      months.push({ year: cursor.getUTCFullYear(), month: cursor.getUTCMonth() });
+      cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+    }
+
+    const responses = await Promise.all(
+      months.map(({ year, month }) =>
+        this.request<{ calendarItems: CalendarItem[] }>(`${CALENDAR_ENDPOINT}/${year}/month/${month}`),
+      ),
+    );
+
+    const workouts = new Map<number, Record<string, unknown>>();
+    for (const item of responses.flatMap((response) => response.calendarItems ?? [])) {
+      if (item.itemType !== 'workout' || item.date < startDate || item.date > endDate) continue;
+      workouts.set(item.id, {
+        scheduleId: item.id,
+        date: item.date,
+        title: item.title,
+        workoutId: item.workoutId,
+        sportTypeKey: item.sportTypeKey,
+        isProtected: item.protectedWorkoutSchedule ?? false,
+      });
+    }
+
+    return [...workouts.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  }
+
+  async unscheduleWorkout(scheduleId: number): Promise<unknown> {
+    return this.request(`${SCHEDULED_WORKOUT_ENDPOINT}/${scheduleId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async deleteWorkout(workoutId: number): Promise<unknown> {
+    return this.request(`${WORKOUT_ENDPOINT}/${workoutId}`, {
+      method: 'DELETE',
+    });
   }
 }

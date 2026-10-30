@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import dotenv from 'dotenv';
 import { GarminClient } from './garmin.client';
 
@@ -609,6 +609,217 @@ describe('GarminClient (live API)', () => {
     it('get_inprogress_virtual_challenges', async () => {
       const data = await client.getInProgressVirtualChallenges();
       expect(data).toBeDefined();
+    }, 30000);
+  });
+
+  describe('Workouts: create -> get -> delete', () => {
+    const createdIds = new Set<number>();
+    const scheduleIds = new Set<number>();
+
+    type LiveStep = Record<string, any>;
+
+    function getLiveSteps(workout: Record<string, any>): LiveStep[] {
+      return workout.workoutSegments[0].workoutSteps;
+    }
+
+    async function expectWorkoutDeleted(workoutId: number): Promise<void> {
+      await client.deleteWorkout(workoutId);
+      createdIds.delete(workoutId);
+      await sleep(DELAY_MS);
+      const status = await client
+        .getWorkout(String(workoutId))
+        .then(() => 200)
+        .catch((e: { response?: { status?: number } }) => e.response?.status);
+      expect(status).toBe(404);
+    }
+
+    afterAll(async () => {
+      for (const scheduleId of scheduleIds) await client.unscheduleWorkout(scheduleId).catch(() => undefined);
+      for (const workoutId of createdIds) await client.deleteWorkout(workoutId).catch(() => undefined);
+    }, 60000);
+
+    it('swim workout', async () => {
+      const created = (await client.createSwimWorkout({
+        name: 'MCP TEST swim',
+        description: 'vitest',
+        poolLength: 25,
+        steps: [
+          { type: 'step', stepType: 'warmup', endCondition: 'distance', value: 200, strokeType: 'free', description: 'RPE 2' },
+          {
+            type: 'repeat',
+            iterations: 4,
+            steps: [
+              { type: 'step', stepType: 'interval', endCondition: 'lap.button', strokeType: 'drill', drillType: 'kick', equipmentType: 'kickboard' },
+              { type: 'step', stepType: 'rest', endCondition: 'time', value: 20 },
+            ],
+          },
+          {
+            type: 'repeat',
+            iterations: 6,
+            steps: [
+              { type: 'step', stepType: 'interval', endCondition: 'distance', value: 100, strokeType: 'free', intensity: 'moderate', equipmentType: 'pull_buoy' },
+              { type: 'step', stepType: 'rest', endCondition: 'lap.button' },
+            ],
+          },
+          { type: 'step', stepType: 'cooldown', endCondition: 'distance', value: 100 },
+        ],
+      })) as { workoutId: number };
+      createdIds.add(created.workoutId);
+      expect(created.workoutId).toBeGreaterThan(0);
+
+      await sleep(DELAY_MS);
+      const workout = (await client.getWorkout(String(created.workoutId))) as Record<string, any>;
+      expect(workout).toMatchObject({
+        workoutId: created.workoutId,
+        workoutName: 'MCP TEST swim',
+        description: 'vitest',
+        sportType: { sportTypeKey: 'swimming' },
+        poolLength: 25,
+      });
+
+      const steps = getLiveSteps(workout);
+      expect(steps).toHaveLength(4);
+      expect(steps[0]).toMatchObject({
+        stepType: { stepTypeKey: 'warmup' },
+        endCondition: { conditionTypeKey: 'distance' },
+        endConditionValue: 200,
+        strokeType: { strokeTypeKey: 'free' },
+        description: 'RPE 2',
+      });
+      expect(steps[1]).toMatchObject({ type: 'RepeatGroupDTO', numberOfIterations: 4, skipLastRestStep: true });
+      expect(steps[1]!.workoutSteps[0]).toMatchObject({
+        endCondition: { conditionTypeKey: 'lap.button' },
+        strokeType: { strokeTypeKey: 'drill' },
+        drillType: { drillTypeKey: 'kick' },
+        equipmentType: { equipmentTypeKey: 'kickboard' },
+      });
+      expect(steps[1]!.workoutSteps[1]).toMatchObject({
+        stepType: { stepTypeKey: 'rest' },
+        endCondition: { conditionTypeKey: 'fixed.rest' },
+        endConditionValue: 20,
+      });
+      expect(steps[2]!.workoutSteps[0]).toMatchObject({
+        equipmentType: { equipmentTypeKey: 'pull_buoy' },
+        secondaryTargetType: { workoutTargetTypeKey: 'swim.instruction' },
+        secondaryTargetValueOne: 4,
+      });
+      expect(steps[2]!.workoutSteps[1]).toMatchObject({ endCondition: { conditionTypeKey: 'lap.button' } });
+      expect(steps[3]).toMatchObject({ stepType: { stepTypeKey: 'cooldown' }, endConditionValue: 100 });
+
+      await expectWorkoutDeleted(created.workoutId);
+    }, 60000);
+
+    it('strength workout', async () => {
+      const created = (await client.createStrengthWorkout({
+        name: 'MCP TEST gym',
+        steps: [
+          { type: 'step', stepType: 'warmup', endCondition: 'time', value: 300, category: 'CARDIO', exerciseName: 'JUMP_ROPE' },
+          {
+            type: 'repeat',
+            iterations: 3,
+            steps: [
+              { type: 'step', stepType: 'interval', endCondition: 'reps', value: 8, category: 'DEADLIFT', exerciseName: 'ROMANIAN_DEADLIFT', weightKg: 50, description: 'RIR 2' },
+              { type: 'step', stepType: 'rest', endCondition: 'time', value: 90 },
+            ],
+          },
+          { type: 'step', stepType: 'interval', endCondition: 'time', value: 45, category: 'PLANK', exerciseName: 'PLANK' },
+          { type: 'step', stepType: 'rest', endCondition: 'lap.button' },
+        ],
+      })) as { workoutId: number };
+      createdIds.add(created.workoutId);
+      expect(created.workoutId).toBeGreaterThan(0);
+
+      await sleep(DELAY_MS);
+      const workout = (await client.getWorkout(String(created.workoutId))) as Record<string, any>;
+      expect(workout).toMatchObject({
+        workoutId: created.workoutId,
+        workoutName: 'MCP TEST gym',
+        sportType: { sportTypeKey: 'strength_training' },
+      });
+
+      const steps = getLiveSteps(workout);
+      expect(steps).toHaveLength(4);
+      expect(steps[0]).toMatchObject({
+        stepType: { stepTypeKey: 'warmup' },
+        endCondition: { conditionTypeKey: 'time' },
+        endConditionValue: 300,
+        category: 'CARDIO',
+        exerciseName: 'JUMP_ROPE',
+      });
+      expect(steps[1]).toMatchObject({ type: 'RepeatGroupDTO', numberOfIterations: 3, skipLastRestStep: false });
+      expect(steps[1]!.workoutSteps[0]).toMatchObject({
+        endCondition: { conditionTypeKey: 'reps' },
+        endConditionValue: 8,
+        category: 'DEADLIFT',
+        exerciseName: 'ROMANIAN_DEADLIFT',
+        weightValue: 50,
+        weightUnit: { unitKey: 'kilogram' },
+        description: 'RIR 2',
+      });
+      expect(steps[1]!.workoutSteps[1]).toMatchObject({
+        stepType: { stepTypeKey: 'rest' },
+        endCondition: { conditionTypeKey: 'time' },
+        endConditionValue: 90,
+      });
+      expect(steps[2]).toMatchObject({ category: 'PLANK', exerciseName: 'PLANK', endConditionValue: 45 });
+      expect(steps[3]).toMatchObject({ endCondition: { conditionTypeKey: 'lap.button' } });
+
+      await expectWorkoutDeleted(created.workoutId);
+    }, 60000);
+
+    it('create with scheduleDate -> list calendar -> unschedule -> delete', async () => {
+      const result = (await client.createSwimWorkout({
+        name: 'MCP TEST scheduled',
+        scheduleDate: '2099-12-31',
+        steps: [{ type: 'step', stepType: 'interval', endCondition: 'distance', value: 400 }],
+      })) as { workout: { workoutId: number }; schedule: { workoutScheduleId: number; calendarDate: string } };
+      createdIds.add(result.workout.workoutId);
+      scheduleIds.add(result.schedule.workoutScheduleId);
+      expect(result.schedule).toMatchObject({ calendarDate: '2099-12-31', workoutId: result.workout.workoutId });
+
+      await sleep(DELAY_MS);
+      const scheduled = (await client.getScheduledWorkout(String(result.schedule.workoutScheduleId))) as Record<string, any>;
+      expect(scheduled).toMatchObject({
+        workoutScheduleId: result.schedule.workoutScheduleId,
+        calendarDate: '2099-12-31',
+        workout: { workoutId: result.workout.workoutId },
+      });
+
+      const listed = (await client.listScheduledWorkouts('2099-12-31', '2099-12-31')) as Record<string, any>[];
+      expect(listed).toContainEqual(
+        expect.objectContaining({
+          scheduleId: result.schedule.workoutScheduleId,
+          workoutId: result.workout.workoutId,
+          title: 'MCP TEST scheduled',
+          sportTypeKey: 'swimming',
+        }),
+      );
+
+      await client.unscheduleWorkout(result.schedule.workoutScheduleId);
+      scheduleIds.delete(result.schedule.workoutScheduleId);
+      await sleep(DELAY_MS);
+
+      const scheduleStatus = await client
+        .getScheduledWorkout(String(result.schedule.workoutScheduleId))
+        .then(() => 200)
+        .catch((e: { response?: { status?: number } }) => e.response?.status);
+      expect(scheduleStatus).toBe(404);
+      const afterUnschedule = (await client.listScheduledWorkouts('2099-12-31', '2099-12-31')) as Record<string, any>[];
+      expect(afterUnschedule.map((w) => w.scheduleId)).not.toContain(result.schedule.workoutScheduleId);
+
+      const stillSaved = (await client.getWorkout(String(result.workout.workoutId))) as Record<string, any>;
+      expect(stillSaved.workoutId).toBe(result.workout.workoutId);
+
+      await expectWorkoutDeleted(result.workout.workoutId);
+    }, 60000);
+
+    it('rejects unknown exercises without creating anything', async () => {
+      await expect(
+        client.createStrengthWorkout({
+          name: 'MCP TEST invalid',
+          steps: [{ type: 'step', stepType: 'interval', endCondition: 'reps', value: 8, category: 'SQUAT', exerciseName: 'FAKE_SQUAT' }],
+        }),
+      ).rejects.toThrow('Unknown Garmin exercises: SQUAT/FAKE_SQUAT');
     }, 30000);
   });
 

@@ -177,6 +177,18 @@ The server communicates over stdio using the [Model Context Protocol](https://mo
 | `get_workouts` | Saved workouts |
 | `get_workout` | Specific workout by ID |
 
+### Workouts (7 tools)
+
+| Tool | Description |
+|------|-------------|
+| `create_swim_workout` | Create a structured pool swim workout (repeats, rests, strokes, drills, equipment, intensity) |
+| `create_strength_workout` | Create a structured strength workout with Garmin exercises, reps/time, load and rests |
+| `search_exercises` | Search the Garmin exercise catalog by name, category or muscle |
+| `schedule_workout` | Schedule a workout on a calendar date |
+| `list_scheduled_workouts` | List workouts on the calendar between two dates, with their scheduleId |
+| `unschedule_workout` | Delete a workout from the calendar by scheduleId (keeps the saved workout) |
+| `delete_workout` | Delete a saved workout |
+
 ## Authentication
 
 Uses Garmin Connect credentials (email/password) via environment variables. OAuth tokens are cached in `~/.garmin-mcp/` to avoid re-authentication on each request.
